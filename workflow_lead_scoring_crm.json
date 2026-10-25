@@ -1,0 +1,230 @@
+{
+  "name": "Production AI Lead Scoring & CRM Router (n8n)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "name": "Webhook Trigger (Inbound Lead)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 320],
+      "id": "node-webhook-inbound"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Валидация и нормализация входных данных лида\nconst item = $input.first().json.body || $input.first().json;\n\nconst cleanName = (item.name || 'Не указано').trim();\nconst cleanContact = (item.contact || item.phone || item.email || item.telegram || '').trim();\nconst cleanText = (item.task_details || item.message || item.text || '').trim();\nconst source = item.source || 'Website Form / Telegram';\n\nif (!cleanContact || !cleanText) {\n  throw new Error('Отказ: Лид не содержит контакта или текста обращения');\n}\n\nreturn [{\n  json: {\n    client_name: cleanName,\n    contact: cleanContact,\n    raw_query: cleanText,\n    source: source,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "name": "Validate & Normalize Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 320],
+      "id": "node-code-validator"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "prompt": "Ты — AI-скоринг ассистент отдела продаж. Твоя задача — объективно оценить потенциал входящей заявки клиента и выдать результат строго в формате JSON.\n\nЗаявка клиента:\nИмя: {{ $json.client_name }}\nКонтакт: {{ $json.contact }}\nЗапрос: {{ $json.raw_query }}\n\nВерни JSON со следующей структурой:\n{\n  \"score\": <число от 1 до 10, где 10 - срочная задача с явным бюджетом, 1 - спам/неадекват>,\n  \"intent\": <строка, например: 'Автоматизация бизнес-процессов', 'Разработка Telegram-бота', 'Интеграция n8n', 'Консультация', 'Спам'>,\n  \"budget_tier\": <'High' (от $2000), 'Medium' ($500-$2000), 'Low' (до $500), 'Unknown'>,\n  \"priority\": <'HOT' (score >= 7), 'WARM' (score 4-6), 'COLD' (score <= 3)>,\n  \"summary\": <краткая выжимка задачи в 1 предложение на русском языке>,\n  \"recommended_action\": <рекомендация для сейлз-менеджера: 'Срочный созвон в течение 10 минут' / 'Отправить бриф' / 'В архив'>\n}",
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "name": "LLM Scoring Engine (JSON-mode)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [640, 320],
+      "id": "node-llm-scorer"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.priority }}",
+              "operation": "equal",
+              "value2": "HOT"
+            }
+          ]
+        }
+      },
+      "name": "Switch: Priority Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [860, 320],
+      "id": "node-priority-switch"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEETS_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "HOT_LEADS",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Дата": "={{ $('Validate & Normalize Lead').item.json.timestamp }}",
+            "Имя": "={{ $('Validate & Normalize Lead').item.json.client_name }}",
+            "Контакт": "={{ $('Validate & Normalize Lead').item.json.contact }}",
+            "Скор (1-10)": "={{ $json.score }}",
+            "Бюджет": "={{ $json.budget_tier }}",
+            "Саммари": "={{ $json.summary }}",
+            "Рекомендация": "={{ $json.recommended_action }}",
+            "Статус": "В РАБОТЕ (HOT)"
+          }
+        }
+      },
+      "name": "Google Sheets (HOT Leads)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1100, 200],
+      "id": "node-sheets-hot"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_ADMIN_CHANNEL_OR_ID",
+        "text": "🔥 ВНИМАНИЕ: ГОРЯЧИЙ ЛИД (СКОР {{ $('LLM Scoring Engine (JSON-mode)').item.json.score }}/10)!\n\n👤 Клиент: {{ $('Validate & Normalize Lead').item.json.client_name }}\n📞 Контакт: {{ $('Validate & Normalize Lead').item.json.contact }}\n🎯 Цель: {{ $('LLM Scoring Engine (JSON-mode)').item.json.intent }}\n💰 Бюджет: {{ $('LLM Scoring Engine (JSON-mode)').item.json.budget_tier }}\n\n📌 Суть запроса: {{ $('LLM Scoring Engine (JSON-mode)').item.json.summary }}\n\n⚡️ Рекомендованное действие: {{ $('LLM Scoring Engine (JSON-mode)').item.json.recommended_action }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": [
+                {
+                  "text": "✅ Взять в работу",
+                  "callbackData": "=claim_lead_{{ $now.timestamp }}"
+                },
+                {
+                  "text": "📞 Связаться в Telegram",
+                  "url": "={{ $('Validate & Normalize Lead').item.json.contact.startsWith('@') ? 'https://t.me/' + $('Validate & Normalize Lead').item.json.contact.replace('@','') : 'https://t.me/' }}"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "name": "Telegram Instant Alert (Sales Team)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1320, 200],
+      "id": "node-telegram-hot-alert"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEETS_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "WARM_ARCHIVE",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Дата": "={{ $('Validate & Normalize Lead').item.json.timestamp }}",
+            "Имя": "={{ $('Validate & Normalize Lead').item.json.client_name }}",
+            "Контакт": "={{ $('Validate & Normalize Lead').item.json.contact }}",
+            "Скор (1-10)": "={{ $json.score }}",
+            "Саммари": "={{ $json.summary }}",
+            "Статус": "Очередь / Стандарт"
+          }
+        }
+      },
+      "name": "Google Sheets (Warm / Standard)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1100, 440],
+      "id": "node-sheets-warm"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_ADMIN_CHAT_ID",
+        "text": "⚠️ Ошибка в пайплайне обработки лидов n8n!\n\nДетали сбоя:\n{{ $json.message || $json.error }}\n\nВремя: {{ $now.format('yyyy-MM-dd HH:mm:ss') }}"
+      },
+      "name": "Error Trigger Handler",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [860, 600],
+      "id": "node-error-handler"
+    }
+  ],
+  "connections": {
+    "Webhook Trigger (Inbound Lead)": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize Lead": {
+      "main": [
+        [
+          {
+            "node": "LLM Scoring Engine (JSON-mode)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Scoring Engine (JSON-mode)": {
+      "main": [
+        [
+          {
+            "node": "Switch: Priority Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch: Priority Router": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets (HOT Leads)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets (Warm / Standard)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets (HOT Leads)": {
+      "main": [
+        [
+          {
+            "node": "Telegram Instant Alert (Sales Team)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {}
+}
